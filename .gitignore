@@ -1,0 +1,12 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+.ipynb_checkpoints/
+
+# local data & outputs (do NOT commit)
+data/*.csv
+outputs/
+
+secrets_local.py
