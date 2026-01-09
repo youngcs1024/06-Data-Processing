@@ -1,24 +1,27 @@
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import re
 import sys
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict, Literal
-
-import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import tools as t  # noqa: E402
 from reporting import render as r  # noqa: E402
 
 from langgraph.graph import StateGraph, START, END  # noqa: E402
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional, TypedDict, Literal
+
+import argparse
+import json
+import os
+import re
+import requests
+
+import tools as t  # noqa: E402
+
+
 
 
 # -------------------------
@@ -321,6 +324,7 @@ class AgentState(TypedDict, total=False):
     out: str
     template: str
     sample_rows: int
+    target: str
     # LLM
     use_llm: bool
     qwen_api_key: str
@@ -342,7 +346,8 @@ class AgentState(TypedDict, total=False):
 
 def node_base_analysis(state: AgentState) -> AgentState:
     cfg = t.RunConfig(sample_rows=int(state["sample_rows"]))
-    analysis = t.run_analysis(state["csv"], output_root=state["out"], cfg=cfg)
+    analysis = t.run_analysis(state["csv"], output_root=state["out"], cfg=cfg, target=(state.get("target") or None))
+
 
     run_dir = str((Path(state["out"]) / analysis["run_id"]).resolve())
     return {
@@ -581,6 +586,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--sample_rows", type=int, default=200_000, help="Max rows to load for analysis (EDA-friendly)")
 
+    p.add_argument("--target", type=str, default="", help="目标列名（可选）。指定后会执行最小建模闭环")
+
     # LLM settings
     p.add_argument("--no_llm", action="store_true", help="Disable LLM (rule-based only)")
     p.add_argument("--qwen_api_key", type=str, default="", help="DashScope API key (optional, can hardcode in code)")
@@ -603,6 +610,7 @@ def main():
         "out": args.out,
         "template": args.template,
         "sample_rows": int(args.sample_rows),
+        "target": args.target.strip() or "",
 
         "use_llm": (not args.no_llm),
         "qwen_api_key": args.qwen_api_key.strip(),

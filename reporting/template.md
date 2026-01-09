@@ -82,26 +82,35 @@
 {# “真正使用LLM增强”= 启用 + 有文本 + 没报错 #}
 {% set llm_used = llm_enabled and llm_has_text and ((llm_error | trim) == "") %}
 
-## 5. 洞见总结{% if llm_used %}（含LLM增强：{{ llm_model }}）{% else %}（仅规则）{% endif %}
 
-{% if llm_enabled and ((llm_error | trim) != "") %}
-> LLM 调用失败：{{ llm_error }}
+## 5. 建模结果
+{% if modeling is defined and modeling and modeling.enabled %}
+- 目标列：{{ modeling.target }}
+- 任务类型：{{ modeling.task_type }}
+- 模型：{{ modeling.model_name }}
+- Train/Test：{{ modeling.n_train }} / {{ modeling.n_test }}
+
+{% if modeling.task_type == "regression" %}
+- 指标：R²={{ modeling.metrics.r2 | round(4) }}, MAE={{ modeling.metrics.mae | round(4) }}
+{% else %}
+- 指标：Accuracy={{ modeling.metrics.accuracy | round(4) }}, F1(macro)={{ modeling.metrics.f1 | round(4) }}
 {% endif %}
 
-### 5.1 规则洞见（来自自动统计/规则引擎）
-{% if insights is defined and insights|length > 0 %}
-{% for s in insights %}
-- {{ s }}
+{% if modeling.statsmodels is defined and modeling.statsmodels.summary_text is defined %}
+### 5.1 Statsmodels 摘要（节选）
+{{ modeling.statsmodels.summary_text }}
+{% endif %}
+
+{% if modeling.statsmodels is defined and modeling.statsmodels.vif_top10 is defined and (modeling.statsmodels.vif_top10|length>0) %}
+
+### 5.2 共线性诊断（VIF Top 10）
+{% for item in modeling.statsmodels.vif_top10 %}
+
+{{ item.feature }}: VIF={{ item.vif | round(2) }}
 {% endfor %}
-{% else %}
-无（本次未生成规则洞见）。
 {% endif %}
 
-{% if llm_enabled and ((llm_error | trim) == "") %}
-### 5.2 LLM 洞见摘要
-{% if llm_has_text %}
-{{ llm_text }}
 {% else %}
-无（本次 LLM 摘要为空；详细洞见见第 6 章）。
-{% endif %}
+
+未指定 --target 或建模失败：{{ modeling.error if modeling is defined and modeling else "no modeling" }}
 {% endif %}

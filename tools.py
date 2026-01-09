@@ -1,5 +1,20 @@
 from __future__ import annotations
 
+# tools.py (新增 import)
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.metrics import r2_score, mean_absolute_error, accuracy_score, f1_score
+
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+
+
+
 import json
 import os
 import uuid
@@ -326,6 +341,232 @@ def feature_engineering(df: pd.DataFrame, roles: Dict[str, str]) -> Tuple[pd.Dat
             log["added_features"].extend([f"{col}_year", f"{col}_month", f"{col}_dow"])
 
     return df_fe, log
+
+
+def infer_task_type(y: pd.Series, low_cardinality: int = 20) -> str:
+    if pd.api.types.is_numeric_dtype(y):
+        nunique = int(y.nunique(dropna=True))
+        return "classification" if nunique <= low_cardinality else "regression"
+    return "classification"
+
+
+def build_model_matrix(df: pd.DataFrame, target: str, max_cat_nunique: int = 50):
+    y = df[target]
+    X = df.drop(columns=[target])
+
+    # drop datetime columns
+    dt_cols = [c for c in X.columns if pd.api.types.is_datetime64_any_dtype(X[c])]
+    if dt_cols:
+        X = X.drop(columns=dt_cols)
+
+    num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c]) and not pd.api.types.is_bool_dtype(X[c])]
+    cat_cols = [c for c in X.columns if (X[c].dtype == "object") or pd.api.types.is_bool_dtype(X[c]) or pd.api.types.is_categorical_dtype(X[c])]
+
+    kept_cat = [c for c in cat_cols if int(X[c].nunique(dropna=True)) <= max_cat_nunique]
+    dropped_cat = [c for c in cat_cols if c not in kept_cat]
+
+    return X, y, num_cols, kept_cat, dropped_cat, dt_cols
+
+def run_min_modeling(df_fe: pd.DataFrame, target: str, cfg: RunConfig) -> Dict:
+    if target not in df_fe.columns:
+        return {"enabled": False, "error": f"target column not found: {target}"}
+
+    X, y, num_cols, cat_cols, dropped_cat, dropped_dt = build_model_matrix(df_fe, target)
+
+    task = infer_task_type(y)
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", Pipeline([("imputer", SimpleImputer(strategy="median"))]), num_cols),
+            ("cat", Pipeline([
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore"))
+            ]), cat_cols),
+        ],
+        remainder="drop",
+    )
+
+    if task == "regression":
+        model = LinearRegression()
+    else:
+        model = LogisticRegression(max_iter=300, n_jobs=None)
+
+    pipe = Pipeline([("prep", pre), ("model", model)])
+
+    # split
+    test_size = 0.2
+    stratify = None
+    if task == "classification":
+        y_str = y.astype(str)
+        # 低基数才 stratify，避免类别太碎
+        if int(y_str.nunique(dropna=True)) <= 20:
+            stratify = y_str
+        y_use = y_str
+    else:
+        y_use = pd.to_numeric(y, errors="coerce")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_use, test_size=test_size, random_state=cfg.random_seed, stratify=stratify
+    )
+
+    pipe.fit(X_train, y_train)
+
+    out = {
+        "enabled": True,
+        "target": target,
+        "task_type": task,
+        "model_name": type(model).__name__,
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
+        "dropped_datetime_cols": dropped_dt,
+        "dropped_high_cardinality_cat_cols": dropped_cat,
+    }
+
+    if task == "regression":
+        pred = pipe.predict(X_test)
+        out["metrics"] = {
+            "r2": float(r2_score(y_test, pred)),
+            "mae": float(mean_absolute_error(y_test, pred)),
+        }
+        try:
+            out["statsmodels"] = statsmodels_ols_summary(df_fe, target=target)
+        except Exception as e:
+            out["statsmodels_error"] = repr(e)   # 记录下来，但不让建模整体失败
+
+    else:
+        pred = pipe.predict(X_test)
+        out["metrics"] = {
+            "accuracy": float(accuracy_score(y_test, pred)),
+            "f1": float(f1_score(y_test, pred, average="macro")),
+        }
+
+    return out
+
+def statsmodels_ols_summary(
+    df_fe: pd.DataFrame,
+    target: str,
+    max_rows: int = 5000,
+    max_features: int = 30,
+    max_cat_levels: int = 20,
+    drop_corr_threshold: float = 0.9999,
+) -> Dict:
+    # 0) 只采样，不做整表 dropna（避免缺失列导致大量丢样本）
+    d = df_fe.copy()
+    if len(d) > max_rows:
+        d = d.sample(n=max_rows, random_state=42)
+
+    # 1) y 数值化，仅删除 y 缺失行
+    y = pd.to_numeric(d[target], errors="coerce")
+    mask = y.notna()
+    d = d.loc[mask].copy()
+    y = y.loc[mask].astype(float)
+
+    # 2) 候选特征列（排除 target、排除 datetime 列）
+    feat_cols = [c for c in d.columns if c != target]
+    feat_cols = [c for c in feat_cols if not pd.api.types.is_datetime64_any_dtype(d[c])]
+
+    # 3) 数值特征：只保留“真正可解释的连续变量”
+    #    - 排除 ID/编码列（tract/area/id/code/zip 等）
+    #    - 排除经纬度（可选：你也可以保留，但常导致洞见弱/共线）
+    num_cols = []
+    for c in feat_cols:
+        if pd.api.types.is_numeric_dtype(d[c]) and (not pd.api.types.is_bool_dtype(d[c])):
+            if _is_code_like_column_name(c):
+                continue
+            if _is_latlon_column_name(c):
+                continue
+            num_cols.append(c)
+
+    X_num = d[num_cols].apply(pd.to_numeric, errors="coerce")
+    # 用 median 填补（与 sklearn 数值 imputer 一致）
+    if X_num.shape[1] > 0:
+        X_num = X_num.fillna(X_num.median(numeric_only=True))
+
+    # 4) 类别特征：只保留低基数、且不是编码列
+    cat_cols = []
+    for c in feat_cols:
+        s = d[c]
+        if s.dtype == "object" or pd.api.types.is_bool_dtype(s) or pd.api.types.is_categorical_dtype(s):
+            if _is_code_like_column_name(c):
+                continue
+            nunique = int(s.nunique(dropna=True))
+            if 2 <= nunique <= max_cat_levels:
+                cat_cols.append(c)
+
+    X_cat = None
+    if cat_cols:
+        X_cat_raw = d[cat_cols].astype("object").fillna("Missing")
+        X_cat = pd.get_dummies(X_cat_raw, drop_first=True)
+
+    # 5) 拼接 X
+    if X_cat is None:
+        X = X_num.copy()
+    elif X_num.shape[1] == 0:
+        X = X_cat.copy()
+    else:
+        X = pd.concat([X_num, X_cat], axis=1)
+
+    # 6) 删除常数列/零方差列（VIF NaN/inf 的主要来源之一）
+    if X.shape[1] == 0:
+        return {"type": "OLS", "error": "No usable features after filtering.", "n_obs": int(len(y))}
+
+    var = X.var(numeric_only=True).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    X = X.loc[:, var > 0]
+
+    # 7) 删除近似完全共线列（例如 start_year 与 end_year 基本恒等）
+    if X.shape[1] >= 2:
+        corr = X.corr(numeric_only=True).abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        drop_cols = [c for c in upper.columns if (upper[c] > drop_corr_threshold).any()]
+        if drop_cols:
+            X = X.drop(columns=drop_cols, errors="ignore")
+
+    # 8) 特征过多时，按与 y 的 |相关系数| 选 topK（让 summary/VIF 更可控）
+    if X.shape[1] > max_features:
+        # 避免 std=0 导致 nan
+        scores = {}
+        yv = y.values
+        for c in X.columns:
+            xv = X[c].values
+            if np.nanstd(xv) == 0:
+                scores[c] = 0.0
+            else:
+                cc = np.corrcoef(xv, yv)[0, 1]
+                scores[c] = 0.0 if np.isnan(cc) else float(abs(cc))
+        keep = sorted(scores, key=lambda k: scores[k], reverse=True)[:max_features]
+        X = X[keep]
+
+    # 9) 拟合 OLS
+    X = X.astype(float)
+    X = sm.add_constant(X, has_constant="add")
+    model = sm.OLS(y, X).fit()
+    summary_text = model.summary().as_text()
+
+    # 10) VIF（对去掉 const 后的矩阵；异常时返回 inf/跳过）
+    vif_items = []
+    try:
+        cols = [c for c in X.columns if c != "const"]
+        if len(cols) >= 2:
+            mat = X[cols].values
+            for i, c in enumerate(cols):
+                try:
+                    v = variance_inflation_factor(mat, i)
+                    if np.isnan(v):
+                        continue
+                    vif_items.append({"feature": c, "vif": float(v)})
+                except Exception:
+                    # 完全共线时可能抛错
+                    vif_items.append({"feature": c, "vif": float("inf")})
+            vif_items = sorted(vif_items, key=lambda x: x["vif"], reverse=True)[:10]
+    except Exception:
+        vif_items = []
+
+    return {
+        "type": "OLS",
+        "n_obs": int(model.nobs),
+        "summary_text": summary_text[:4000],
+        "vif_top10": vif_items,
+    }
 
 
 # -------------------------
@@ -736,7 +977,7 @@ def generate_rule_based_insights(profile: Dict, cleaning_log: Dict, tests: List[
 # 9) Orchestration
 # -------------------------
 
-def run_analysis(csv_path: str, output_root: str = "outputs", cfg: Optional[RunConfig] = None) -> Dict:
+def run_analysis(csv_path: str, output_root: str = "outputs", cfg: Optional[RunConfig] = None, target: Optional[str] = None) -> Dict:
     cfg = cfg or RunConfig()
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
 
@@ -750,6 +991,13 @@ def run_analysis(csv_path: str, output_root: str = "outputs", cfg: Optional[RunC
     profile_raw = profile_dataset(df_raw, roles, cfg)
     df_clean, cleaning_log = clean_dataset(df_raw, roles, cfg)
     df_fe, fe_log = feature_engineering(df_clean, roles)
+
+    modeling = None
+    if target:
+        try:
+            modeling = run_min_modeling(df_fe, target=target, cfg=cfg)
+        except Exception as e:
+            modeling = {"enabled": False, "target": target, "error": repr(e)}
 
     plots = make_plots(df_raw, df_clean, roles, fig_dir, cfg)
     tests = run_stat_tests(df_clean, roles, cfg)
@@ -773,6 +1021,7 @@ def run_analysis(csv_path: str, output_root: str = "outputs", cfg: Optional[RunC
         ],
         "tests": tests,
         "insights": insights,
+        "modeling": modeling,
     }
 
     # save analysis.json
