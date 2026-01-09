@@ -6,7 +6,7 @@ __pycache__/
 .ipynb_checkpoints/
 
 # local data & outputs (do NOT commit)
-data/*.csv
+uploads/
 outputs/
 
 secrets_local.py

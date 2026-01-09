@@ -12,9 +12,6 @@ from sklearn.metrics import r2_score, mean_absolute_error, accuracy_score, f1_sc
 import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
-
-
-
 import json
 import os
 import uuid
@@ -74,7 +71,7 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
 
 def load_csv(csv_path: str, cfg: RunConfig) -> Tuple[pd.DataFrame, Dict]:
     """
-    大数据友好：只读前 sample_rows 行(足够做EDA/检验/画图)
+    只读前 sample_rows 行
     """
     df = pd.read_csv(csv_path, nrows=cfg.sample_rows, low_memory=False)
     meta = {
@@ -136,10 +133,6 @@ def _is_code_like_column_name(col: str) -> bool:
     # "community area" 会拆成 community + area
     if "community" in toks and "area" in toks:
         return True
-
-    # # 可选：单独的 area 也可能是编码（如果你觉得误伤多，可以删掉这行）
-    # if "area" in toks:
-    #     return True
 
     return False
 
@@ -303,14 +296,14 @@ def clean_dataset(df: pd.DataFrame, roles: Dict[str, str], cfg: RunConfig) -> Tu
         is_code_like = _is_code_like_column_name(col)
 
         # A) 编码列 / 类别列：统一用显式缺失类别，避免 mode/median 造成偏置
-        #    注意：即使它的 dtype 是 numeric，我们也把它当 categorical 来处理。
+        #    注：即使 dtype 是 numeric，也把它当 categorical 来处理。
         if is_code_like or role in ("categorical", "text"):
             fill_value = "Missing"
             df_clean[col] = s.astype("object").fillna(fill_value)
             log["imputations"].append({"column": col, "method": "missing_category", "value": fill_value})
             continue
 
-        # B) 真正的连续数值列：用 median（稳健）
+        # B) 真正的连续数值列：用 median
         if pd.api.types.is_numeric_dtype(s) or role == "numeric":
             s_num = pd.to_numeric(s, errors="coerce")
             fill_value = float(s_num.median(skipna=True)) if s_num.notna().any() else 0.0
@@ -467,7 +460,7 @@ def statsmodels_ols_summary(
 
     # 3) 数值特征：只保留“真正可解释的连续变量”
     #    - 排除 ID/编码列（tract/area/id/code/zip 等）
-    #    - 排除经纬度（可选：你也可以保留，但常导致洞见弱/共线）
+    #    - 排除经纬度
     num_cols = []
     for c in feat_cols:
         if pd.api.types.is_numeric_dtype(d[c]) and (not pd.api.types.is_bool_dtype(d[c])):
@@ -852,7 +845,7 @@ def run_stat_tests(df: pd.DataFrame, roles: Dict[str, str], cfg: RunConfig, targ
                 "x": x, "y": y,
                 "statistic": float(r),
                 "p_value": float(p),
-                "p_value_fmt": format_p_value(p),  # 如果你已加 p 格式化
+                "p_value_fmt": format_p_value(p),  
                 "note": "数值-数值相关显著性检验(Pearson,已过滤 trivial total/component 列对)。"
             })
 
